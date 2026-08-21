@@ -190,7 +190,10 @@ func TestBGPPolicyServiceMED(t *testing.T) {
 	t.Run("NodePriority mode ranks the Nodes of the ExternalIPPool", func(t *testing.T) {
 		skipIfFeatureDisabled(t, features.ServiceExternalIP, true, false)
 
-		ipRange := v1beta1.IPRange{CIDR: "172.31.10.0/28"}
+		// Take the range from the shared generator so that it cannot overlap the pools of the other
+		// tests, which the ExternalIPPool validator would reject, and so that it stays out of the
+		// Docker address space the Kind network is carved from.
+		ipRange := v1beta1.IPRange{CIDR: ipPoolRangeV4.next().getCIDR(28)}
 		pool := data.createExternalIPPool(t, "bgp-med-pool-", ipRange, nil, nil, nil)
 		defer data.CRDClient.CrdV1beta1().ExternalIPPools().Delete(context.TODO(), pool.Name, metav1.DeleteOptions{})
 
@@ -219,26 +222,35 @@ func TestBGPPolicyServiceMED(t *testing.T) {
 		})
 
 		numNodes := len(clusterInfo.nodes)
-		paths := checkFRRRouterBGPPaths(t, prefix, 60*time.Second, func(paths []frrPath) bool {
-			return len(paths) == numNodes
+		expectedMEDs := make([]uint32, 0, numNodes)
+		for i := 0; i < numNodes; i++ {
+			expectedMEDs = append(expectedMEDs, uint32(base+int64(i)*step))
+		}
+
+		// The ladder is only complete once every Agent has converged on the same view of the
+		// ExternalIPPool: until then an Agent whose consistent hash ring has not synced yet falls back
+		// to the base value, so two Nodes can transiently advertise the same MED. Wait for the
+		// converged state rather than asserting on the first sample.
+		paths := checkFRRRouterBGPPaths(t, prefix, 90*time.Second, func(paths []frrPath) bool {
+			if len(paths) != numNodes {
+				return false
+			}
+			meds := make([]uint32, 0, len(paths))
+			for _, p := range paths {
+				meds = append(meds, p.MED)
+			}
+			slices.Sort(meds)
+			return slices.Equal(meds, expectedMEDs)
 		})
 
-		// Every Node must advertise the IP with a distinct MED taken from the expected ladder, and
-		// the path with the base value must be the one FRR selects.
-		var meds []uint32
+		// Every Node advertises a distinct MED from the expected ladder; the path carrying the base
+		// value must be the one FRR selects as best.
 		var bestMED uint32
 		for _, p := range paths {
-			meds = append(meds, p.MED)
 			if p.Best {
 				bestMED = p.MED
 			}
 		}
-		slices.Sort(meds)
-		var expectedMEDs []uint32
-		for i := 0; i < numNodes; i++ {
-			expectedMEDs = append(expectedMEDs, uint32(base+int64(i)*step))
-		}
-		assert.Equal(t, expectedMEDs, meds, "Each Node must advertise %s with a distinct MED, got: %+v", prefix, paths)
 		assert.Equal(t, uint32(base), bestMED, "The most preferred path must be the one with the base MED, got: %+v", paths)
 	})
 }
