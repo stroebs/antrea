@@ -43,8 +43,6 @@ type frrPath struct {
 	// MED is the MULTI_EXIT_DISC attribute of the path, 0 when the attribute is absent, which is how
 	// FRR itself compares a path without a MED.
 	MED uint32
-	// Best reports whether FRR selected this path as the best one for the prefix.
-	Best bool
 }
 
 // dumpFRRRouterBGPPaths returns every BGP path known to the remote FRR router, keyed by prefix.
@@ -56,15 +54,15 @@ func dumpFRRRouterBGPPaths() (map[string][]frrPath, error) {
 		log.Println(stderr)
 		return nil, fmt.Errorf("error when running command to show the BGP table: %v, rc: %d", err, rc)
 	}
-	// Only the fields the test needs are declared. FRR reports the MED as "metric"; "med" is
-	// accepted as well so that the test keeps working if the field is ever renamed.
+	// Only the fields the test needs are declared, and only ones whose shape is stable across FRR
+	// versions: the per-path "bestpath" member is a plain boolean in some releases and an object in
+	// others, so it is deliberately not parsed. FRR reports the MED as "metric" and omits it when the
+	// path carries no MULTI_EXIT_DISC attribute; "med" is accepted as well in case it is ever
+	// renamed.
 	var parsed struct {
 		Routes map[string][]struct {
 			Metric   *uint32 `json:"metric"`
 			MED      *uint32 `json:"med"`
-			Bestpath *struct {
-				Overall bool `json:"overall"`
-			} `json:"bestpath"`
 			Nexthops []struct {
 				IP string `json:"ip"`
 			} `json:"nexthops"`
@@ -76,7 +74,7 @@ func dumpFRRRouterBGPPaths() (map[string][]frrPath, error) {
 	paths := make(map[string][]frrPath, len(parsed.Routes))
 	for prefix, entries := range parsed.Routes {
 		for _, entry := range entries {
-			path := frrPath{Best: entry.Bestpath != nil && entry.Bestpath.Overall}
+			var path frrPath
 			if entry.Metric != nil {
 				path.MED = *entry.Metric
 			} else if entry.MED != nil {
@@ -197,21 +195,30 @@ func TestBGPPolicyServiceMED(t *testing.T) {
 		pool := data.createExternalIPPool(t, "bgp-med-pool-", ipRange, nil, nil, nil)
 		defer data.CRDClient.CrdV1beta1().ExternalIPPools().Delete(context.TODO(), pool.Name, metav1.DeleteOptions{})
 
-		svc, err := data.createAgnhostLoadBalancerService("agnhost-med-priority", false, false, nil, ptr.To(corev1.IPv4Protocol),
-			map[string]string{agenttypes.ServiceExternalIPPoolAnnotationKey: pool.Name})
+		// createAgnhostLoadBalancerService is not usable here: it patches status.loadBalancer.ingress
+		// itself, which fights with the allocation antrea-controller performs from the ExternalIPPool.
+		svc, err := data.CreateServiceWithAnnotations("agnhost-med-priority", data.testNamespace, 8080, 8080,
+			corev1.ProtocolTCP, map[string]string{"app": "agnhost"}, false, false, corev1.ServiceTypeLoadBalancer,
+			ptr.To(corev1.IPv4Protocol), map[string]string{agenttypes.ServiceExternalIPPoolAnnotationKey: pool.Name})
 		require.NoError(t, err)
 		defer data.deleteService(svc.Namespace, svc.Name)
 
-		// The external IP is allocated asynchronously by antrea-controller.
-		var externalIP string
-		require.NoError(t, wait.PollUntilContextTimeout(context.Background(), time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-			svc, err := data.clientset.CoreV1().Services(svc.Namespace).Get(ctx, svc.Name, metav1.GetOptions{})
-			if err != nil || len(svc.Status.LoadBalancer.Ingress) == 0 {
+		// The external IP is allocated asynchronously by antrea-controller, and the owner of the IP is
+		// elected by the Agents. Both are needed below: the owner is the Node that must advertise the
+		// most preferred path.
+		var externalIP, ownerNode string
+		require.NoError(t, wait.PollUntilContextTimeout(context.Background(), time.Second, 60*time.Second, true, func(ctx context.Context) (bool, error) {
+			cur, err := data.clientset.CoreV1().Services(svc.Namespace).Get(ctx, svc.Name, metav1.GetOptions{})
+			if err != nil || len(cur.Status.LoadBalancer.Ingress) == 0 || cur.Status.LoadBalancer.Ingress[0].IP == "" {
 				return false, nil
 			}
-			externalIP = svc.Status.LoadBalancer.Ingress[0].IP
-			return externalIP != "", nil
-		}), "The Service never got an external IP from the ExternalIPPool")
+			ownerNode, err = data.getServiceAssignedNode("", cur)
+			if err != nil || ownerNode == "" {
+				return false, nil
+			}
+			externalIP = cur.Status.LoadBalancer.Ingress[0].IP
+			return true, nil
+		}), "The Service never got an external IP from the ExternalIPPool assigned to a Node")
 		prefix := externalIP + "/32"
 
 		const base, step = int64(100), int64(100)
@@ -243,14 +250,32 @@ func TestBGPPolicyServiceMED(t *testing.T) {
 			return slices.Equal(meds, expectedMEDs)
 		})
 
-		// Every Node advertises a distinct MED from the expected ladder; the path carrying the base
-		// value must be the one FRR selects as best.
-		var bestMED uint32
+		// The ladder above proves the MED values are right. This proves they come from distinct Nodes,
+		// i.e. that every Node advertises exactly one path and picked its own rank.
+		nexthops := make([]string, 0, len(paths))
 		for _, p := range paths {
-			if p.Best {
-				bestMED = p.MED
+			nexthops = append(nexthops, p.Nexthop)
+		}
+		assert.ElementsMatch(t, getAllNodeIPs(), nexthops, "Each Node must advertise exactly one path for %s, got: %+v", prefix, paths)
+
+		// And this is the property the whole mode exists for: the most preferred path is advertised by
+		// the Node that owns the IP, so the BGP peers send the traffic where the IP actually is. Note
+		// that the best-path selection itself is FRR's job, so what is checked is the MED Antrea
+		// attached, not what FRR did with it.
+		ownerIP := ""
+		for idx := range clusterInfo.nodes {
+			if nodeName(idx) == ownerNode {
+				ownerIP = nodeIPv4(idx)
+				break
 			}
 		}
-		assert.Equal(t, uint32(base), bestMED, "The most preferred path must be the one with the base MED, got: %+v", paths)
+		require.NotEmpty(t, ownerIP, "Could not resolve the IP of the owner Node %q", ownerNode)
+		for _, p := range paths {
+			if p.Nexthop == ownerIP {
+				assert.Equal(t, uint32(base), p.MED, "The Node owning %s must advertise the base MED, got: %+v", prefix, paths)
+			} else {
+				assert.NotEqual(t, uint32(base), p.MED, "Only the Node owning %s may advertise the base MED, got: %+v", prefix, paths)
+			}
+		}
 	})
 }
