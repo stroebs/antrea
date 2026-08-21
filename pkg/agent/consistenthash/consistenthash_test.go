@@ -312,3 +312,35 @@ func TestGetNWithFilters(t *testing.T) {
 		assert.Empty(t, New(50, nil).GetNWithFilters("2", 0))
 	})
 }
+
+// TestGetNWithFiltersRemovalEquivalence pins down the invariant that the ranking is built on: the
+// i-th entry is what Get would return if the entries before it were removed from the ring. Egress
+// and ServiceExternalIP failover rely on it to move an IP to the next ranked Node rather than an
+// arbitrary one, and the BGP MED ranking relies on it so that a Node's rank only shifts by one when
+// a more preferred Node leaves.
+func TestGetNWithFiltersRemovalEquivalence(t *testing.T) {
+	for _, numKeys := range []int{1, 2, 3, 5, 10} {
+		t.Run(strconv.Itoa(numKeys)+" keys", func(t *testing.T) {
+			keys := make([]string, 0, numKeys)
+			for i := 0; i < numKeys; i++ {
+				keys = append(keys, fmt.Sprintf("node-%d", i))
+			}
+			m := New(50, nil)
+			m.Add(keys...)
+
+			for _, key := range []string{"10.0.0.1", "10.0.0.2", "192.168.77.150", "fec0::1"} {
+				ranking := m.GetNWithFilters(key, 0)
+				require.Len(t, ranking, numKeys, "every key must be ranked")
+
+				// Remove the ranked keys one at a time; the head of the remaining ranking must always
+				// be what a plain Get returns.
+				shrunk := New(50, nil)
+				shrunk.Add(keys...)
+				for rank, expected := range ranking {
+					require.Equal(t, expected, shrunk.Get(key), "key=%s rank=%d", key, rank)
+					shrunk.Remove(expected)
+				}
+			}
+		})
+	}
+}

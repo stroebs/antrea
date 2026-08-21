@@ -18,8 +18,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,14 +45,34 @@ type frrPath struct {
 	MED uint32
 }
 
+// vtyshJSONOutput runs a vtysh command whose output is a JSON document and returns just that
+// document. vtysh prints a banner, echoes the command it read from stdin, and prints its prompt
+// around the output, so the document has to be carved out of the surrounding text before it can be
+// unmarshalled. Neither the banner nor the prompt contains a brace, so the first "{" and the last
+// "}" delimit the document.
+func vtyshJSONOutput(command string) ([]byte, error) {
+	rc, stdout, stderr, err := runVtyshCommands([]string{command})
+	if err != nil {
+		return nil, fmt.Errorf("error when running %q: %w (stderr: %s)", command, err, stderr)
+	}
+	if rc != 0 {
+		return nil, fmt.Errorf("running %q returned code %d (stdout: %s, stderr: %s)", command, rc, stdout, stderr)
+	}
+	start := strings.Index(stdout, "{")
+	end := strings.LastIndex(stdout, "}")
+	if start < 0 || end < start {
+		return nil, fmt.Errorf("no JSON document in the output of %q: %s", command, stdout)
+	}
+	return []byte(stdout[start : end+1]), nil
+}
+
 // dumpFRRRouterBGPPaths returns every BGP path known to the remote FRR router, keyed by prefix.
 // Unlike dumpFRRRouterBGPRoutes, which reads the routing table and therefore only sees the selected
 // paths, this reads the BGP table so that the backup paths and their attributes are visible too.
 func dumpFRRRouterBGPPaths() (map[string][]frrPath, error) {
-	rc, stdout, stderr, err := runVtyshCommands([]string{"show bgp ipv4 unicast json"})
-	if err != nil || rc != 0 {
-		log.Println(stderr)
-		return nil, fmt.Errorf("error when running command to show the BGP table: %v, rc: %d", err, rc)
+	doc, err := vtyshJSONOutput("show bgp ipv4 unicast json")
+	if err != nil {
+		return nil, err
 	}
 	// Only the fields the test needs are declared, and only ones whose shape is stable across FRR
 	// versions: the per-path "bestpath" member is a plain boolean in some releases and an object in
@@ -68,8 +88,8 @@ func dumpFRRRouterBGPPaths() (map[string][]frrPath, error) {
 			} `json:"nexthops"`
 		} `json:"routes"`
 	}
-	if err := json.Unmarshal([]byte(stdout), &parsed); err != nil {
-		return nil, fmt.Errorf("error when parsing the BGP table: %w", err)
+	if err := json.Unmarshal(doc, &parsed); err != nil {
+		return nil, fmt.Errorf("error when parsing the BGP table %s: %w", doc, err)
 	}
 	paths := make(map[string][]frrPath, len(parsed.Routes))
 	for prefix, entries := range parsed.Routes {
@@ -90,19 +110,30 @@ func dumpFRRRouterBGPPaths() (map[string][]frrPath, error) {
 }
 
 // checkFRRRouterBGPPaths polls the BGP table of the remote FRR router until the paths for prefix
-// satisfy the given condition.
+// satisfy the given condition. Reading the table is retried rather than treated as fatal, since it
+// races with the BGP session coming up, but the last error is reported if the condition is never
+// met: without it a persistently failing read is indistinguishable from a prefix that is simply
+// never advertised.
 func checkFRRRouterBGPPaths(t *testing.T, prefix string, timeout time.Duration, condition func([]frrPath) bool) []frrPath {
 	t.Helper()
-	var got []frrPath
+	var got, allPaths []frrPath
+	var lastErr error
 	err := wait.PollUntilContextTimeout(context.Background(), time.Second, timeout, true, func(context.Context) (bool, error) {
 		paths, err := dumpFRRRouterBGPPaths()
 		if err != nil {
+			lastErr = err
 			return false, nil
 		}
+		lastErr = nil
 		got = paths[prefix]
+		allPaths = nil
+		for _, ps := range paths {
+			allPaths = append(allPaths, ps...)
+		}
 		return condition(got), nil
 	})
-	require.NoError(t, err, "The BGP paths for %s never matched the expectation, got: %+v", prefix, got)
+	require.NoError(t, err, "The BGP paths for %s never matched the expectation.\nPaths for the prefix: %+v\nLast read error: %v\nEvery path in the table: %+v",
+		prefix, got, lastErr, allPaths)
 	return got
 }
 
