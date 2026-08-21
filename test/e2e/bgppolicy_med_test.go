@@ -1,0 +1,312 @@
+// Copyright 2026 Antrea Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package e2e
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/utils/ptr"
+
+	agenttypes "antrea.io/antrea/v2/pkg/agent/types"
+	crdv1alpha1 "antrea.io/antrea/v2/pkg/apis/crd/v1alpha1"
+	"antrea.io/antrea/v2/pkg/apis/crd/v1beta1"
+	"antrea.io/antrea/v2/pkg/features"
+)
+
+// frrPath is one BGP path for a prefix as reported by the remote FRR router.
+type frrPath struct {
+	// Nexthop is the address of the Node which advertised the path.
+	Nexthop string
+	// MED is the MULTI_EXIT_DISC attribute of the path, 0 when the attribute is absent, which is how
+	// FRR itself compares a path without a MED.
+	MED uint32
+}
+
+// vtyshJSONOutput runs a vtysh command whose output is a JSON document and returns just that
+// document. vtysh prints a banner, echoes the command it read from stdin, and prints its prompt
+// around the output, so the document has to be carved out of the surrounding text before it can be
+// unmarshalled. Neither the banner nor the prompt contains a brace, so the first "{" and the last
+// "}" delimit the document.
+func vtyshJSONOutput(command string) ([]byte, error) {
+	rc, stdout, stderr, err := runVtyshCommands([]string{command})
+	if err != nil {
+		return nil, fmt.Errorf("error when running %q: %w (stderr: %s)", command, err, stderr)
+	}
+	if rc != 0 {
+		return nil, fmt.Errorf("running %q returned code %d (stdout: %s, stderr: %s)", command, rc, stdout, stderr)
+	}
+	start := strings.Index(stdout, "{")
+	end := strings.LastIndex(stdout, "}")
+	if start < 0 || end < start {
+		return nil, fmt.Errorf("no JSON document in the output of %q: %s", command, stdout)
+	}
+	return []byte(stdout[start : end+1]), nil
+}
+
+// dumpFRRRouterBGPPaths returns every BGP path known to the remote FRR router, keyed by prefix.
+// Unlike dumpFRRRouterBGPRoutes, which reads the routing table and therefore only sees the selected
+// paths, this reads the BGP table so that the backup paths and their attributes are visible too.
+func dumpFRRRouterBGPPaths() (map[string][]frrPath, error) {
+	doc, err := vtyshJSONOutput("show bgp ipv4 unicast json")
+	if err != nil {
+		return nil, err
+	}
+	// Only the fields the test needs are declared, and only ones whose shape is stable across FRR
+	// versions: the per-path "bestpath" member is a plain boolean in some releases and an object in
+	// others, so it is deliberately not parsed. FRR reports the MED as "metric" and omits it when the
+	// path carries no MULTI_EXIT_DISC attribute; "med" is accepted as well in case it is ever
+	// renamed.
+	var parsed struct {
+		Routes map[string][]struct {
+			Metric   *uint32 `json:"metric"`
+			MED      *uint32 `json:"med"`
+			Nexthops []struct {
+				IP string `json:"ip"`
+			} `json:"nexthops"`
+		} `json:"routes"`
+	}
+	if err := json.Unmarshal(doc, &parsed); err != nil {
+		return nil, fmt.Errorf("error when parsing the BGP table %s: %w", doc, err)
+	}
+	paths := make(map[string][]frrPath, len(parsed.Routes))
+	for prefix, entries := range parsed.Routes {
+		for _, entry := range entries {
+			var path frrPath
+			if entry.Metric != nil {
+				path.MED = *entry.Metric
+			} else if entry.MED != nil {
+				path.MED = *entry.MED
+			}
+			if len(entry.Nexthops) > 0 {
+				path.Nexthop = entry.Nexthops[0].IP
+			}
+			paths[prefix] = append(paths[prefix], path)
+		}
+	}
+	return paths, nil
+}
+
+// checkFRRRouterBGPPaths polls the BGP table of the remote FRR router until the paths for prefix
+// satisfy the given condition. Reading the table is retried rather than treated as fatal, since it
+// races with the BGP session coming up, but the last error is reported if the condition is never
+// met: without it a persistently failing read is indistinguishable from a prefix that is simply
+// never advertised.
+func checkFRRRouterBGPPaths(t *testing.T, prefix string, timeout time.Duration, condition func([]frrPath) bool) []frrPath {
+	t.Helper()
+	var got, allPaths []frrPath
+	var lastErr error
+	err := wait.PollUntilContextTimeout(context.Background(), time.Second, timeout, true, func(context.Context) (bool, error) {
+		paths, err := dumpFRRRouterBGPPaths()
+		if err != nil {
+			lastErr = err
+			return false, nil
+		}
+		lastErr = nil
+		got = paths[prefix]
+		allPaths = nil
+		for _, ps := range paths {
+			allPaths = append(allPaths, ps...)
+		}
+		return condition(got), nil
+	})
+	require.NoError(t, err, "The BGP paths for %s never matched the expectation.\nPaths for the prefix: %+v\nLast read error: %v\nEvery path in the table: %+v",
+		prefix, got, lastErr, allPaths)
+	return got
+}
+
+// TestBGPPolicyServiceMED verifies that the MULTI_EXIT_DISC attribute configured in a BGPPolicy
+// reaches the remote BGP peer, in both the Static and the NodePriority modes.
+func TestBGPPolicyServiceMED(t *testing.T) {
+	skipIfFeatureDisabled(t, features.BGPPolicy, true, false)
+	skipIfNotIPv4Cluster(t)
+	skipIfHasWindowsNodes(t)
+	skipIfExternalFRRNotSet(t)
+	skipIfNumNodesLessThan(t, 2)
+
+	data, err := setupTest(t)
+	require.NoError(t, err, "Error when setting up test")
+	defer teardownTest(t, data)
+
+	t.Log("Updating the specific Secret storing the passwords of BGP peers")
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: kubeNamespace,
+			Name:      agenttypes.BGPPolicySecretName,
+		},
+		Data: map[string][]byte{
+			fmt.Sprintf("%s-%d", externalInfo.externalFRRIPv4, int32(65000)): []byte(bgpPeerPassword),
+		},
+	}
+	_, err = data.clientset.CoreV1().Secrets(kubeNamespace).Create(context.TODO(), secret, metav1.CreateOptions{})
+	require.NoError(t, err)
+	defer data.clientset.CoreV1().Secrets(kubeNamespace).Delete(context.TODO(), agenttypes.BGPPolicySecretName, metav1.DeleteOptions{})
+
+	// No backend Pod is needed: both Services use the default `externalTrafficPolicy: Cluster`, so
+	// their IPs are advertised regardless of where the Endpoints are.
+	configureExternalBGPRouter(t, int32(65000), int32(64512), true)
+
+	createBGPPolicy := func(t *testing.T, ipTypes []crdv1alpha1.ServiceIPType, med *crdv1alpha1.MEDAdvertisement) {
+		t.Helper()
+		bgpPolicy := &crdv1alpha1.BGPPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-med-policy"},
+			Spec: crdv1alpha1.BGPPolicySpec{
+				NodeSelector: metav1.LabelSelector{MatchLabels: map[string]string{}},
+				LocalASN:     int32(64512),
+				ListenPort:   ptr.To[int32](179),
+				Advertisements: crdv1alpha1.Advertisements{
+					Service: &crdv1alpha1.ServiceAdvertisement{IPTypes: ipTypes, MED: med},
+				},
+				BGPPeers: []crdv1alpha1.BGPPeer{
+					{Address: externalInfo.externalFRRIPv4, ASN: int32(65000)},
+				},
+			},
+		}
+		_, err := data.CRDClient.CrdV1alpha1().BGPPolicies().Create(context.TODO(), bgpPolicy, metav1.CreateOptions{})
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			data.CRDClient.CrdV1alpha1().BGPPolicies().Delete(context.TODO(), bgpPolicy.Name, metav1.DeleteOptions{})
+		})
+	}
+
+	t.Run("Static mode applies the same MED on every Node", func(t *testing.T) {
+		svc, err := data.createAgnhostClusterIPService("agnhost-med-static", false, ptr.To(corev1.IPv4Protocol))
+		require.NoError(t, err)
+		defer data.deleteService(svc.Namespace, svc.Name)
+		prefix := svc.Spec.ClusterIP + "/32"
+
+		createBGPPolicy(t, []crdv1alpha1.ServiceIPType{crdv1alpha1.ServiceIPTypeClusterIP}, &crdv1alpha1.MEDAdvertisement{
+			Mode:      crdv1alpha1.MEDModeStatic,
+			BaseValue: ptr.To[int64](500),
+		})
+
+		paths := checkFRRRouterBGPPaths(t, prefix, 60*time.Second, func(paths []frrPath) bool {
+			if len(paths) != len(clusterInfo.nodes) {
+				return false
+			}
+			for _, p := range paths {
+				if p.MED != 500 {
+					return false
+				}
+			}
+			return true
+		})
+		t.Logf("Every Node advertised %s with MED 500: %+v", prefix, paths)
+	})
+
+	t.Run("NodePriority mode ranks the Nodes of the ExternalIPPool", func(t *testing.T) {
+		skipIfFeatureDisabled(t, features.ServiceExternalIP, true, false)
+
+		// Take the range from the shared generator so that it cannot overlap the pools of the other
+		// tests, which the ExternalIPPool validator would reject, and so that it stays out of the
+		// Docker address space the Kind network is carved from.
+		ipRange := v1beta1.IPRange{CIDR: ipPoolRangeV4.next().getCIDR(28)}
+		pool := data.createExternalIPPool(t, "bgp-med-pool-", ipRange, nil, nil, nil)
+		defer data.CRDClient.CrdV1beta1().ExternalIPPools().Delete(context.TODO(), pool.Name, metav1.DeleteOptions{})
+
+		// createAgnhostLoadBalancerService is not usable here: it patches status.loadBalancer.ingress
+		// itself, which fights with the allocation antrea-controller performs from the ExternalIPPool.
+		svc, err := data.CreateServiceWithAnnotations("agnhost-med-priority", data.testNamespace, 8080, 8080,
+			corev1.ProtocolTCP, map[string]string{"app": "agnhost"}, false, false, corev1.ServiceTypeLoadBalancer,
+			ptr.To(corev1.IPv4Protocol), map[string]string{agenttypes.ServiceExternalIPPoolAnnotationKey: pool.Name})
+		require.NoError(t, err)
+		defer data.deleteService(svc.Namespace, svc.Name)
+
+		// The external IP is allocated asynchronously by antrea-controller, and the owner of the IP is
+		// elected by the Agents. Both are needed below: the owner is the Node that must advertise the
+		// most preferred path.
+		var externalIP, ownerNode string
+		require.NoError(t, wait.PollUntilContextTimeout(context.Background(), time.Second, 60*time.Second, true, func(ctx context.Context) (bool, error) {
+			cur, err := data.clientset.CoreV1().Services(svc.Namespace).Get(ctx, svc.Name, metav1.GetOptions{})
+			if err != nil || len(cur.Status.LoadBalancer.Ingress) == 0 || cur.Status.LoadBalancer.Ingress[0].IP == "" {
+				return false, nil
+			}
+			ownerNode, err = data.getServiceAssignedNode("", cur)
+			if err != nil || ownerNode == "" {
+				return false, nil
+			}
+			externalIP = cur.Status.LoadBalancer.Ingress[0].IP
+			return true, nil
+		}), "The Service never got an external IP from the ExternalIPPool assigned to a Node")
+		prefix := externalIP + "/32"
+
+		const base, step = int64(100), int64(100)
+		createBGPPolicy(t, []crdv1alpha1.ServiceIPType{crdv1alpha1.ServiceIPTypeLoadBalancerIP}, &crdv1alpha1.MEDAdvertisement{
+			Mode:      crdv1alpha1.MEDModeNodePriority,
+			BaseValue: ptr.To(base),
+			Step:      ptr.To(step),
+		})
+
+		numNodes := len(clusterInfo.nodes)
+		expectedMEDs := make([]uint32, 0, numNodes)
+		for i := 0; i < numNodes; i++ {
+			expectedMEDs = append(expectedMEDs, uint32(base+int64(i)*step))
+		}
+
+		// The ladder is only complete once every Agent has converged on the same view of the
+		// ExternalIPPool: until then an Agent whose consistent hash ring has not synced yet falls back
+		// to the base value, so two Nodes can transiently advertise the same MED. Wait for the
+		// converged state rather than asserting on the first sample.
+		paths := checkFRRRouterBGPPaths(t, prefix, 90*time.Second, func(paths []frrPath) bool {
+			if len(paths) != numNodes {
+				return false
+			}
+			meds := make([]uint32, 0, len(paths))
+			for _, p := range paths {
+				meds = append(meds, p.MED)
+			}
+			slices.Sort(meds)
+			return slices.Equal(meds, expectedMEDs)
+		})
+
+		// The ladder above proves the MED values are right. This proves they come from distinct Nodes,
+		// i.e. that every Node advertises exactly one path and picked its own rank.
+		nexthops := make([]string, 0, len(paths))
+		for _, p := range paths {
+			nexthops = append(nexthops, p.Nexthop)
+		}
+		assert.ElementsMatch(t, getAllNodeIPs(), nexthops, "Each Node must advertise exactly one path for %s, got: %+v", prefix, paths)
+
+		// And this is the property the whole mode exists for: the most preferred path is advertised by
+		// the Node that owns the IP, so the BGP peers send the traffic where the IP actually is. Note
+		// that the best-path selection itself is FRR's job, so what is checked is the MED Antrea
+		// attached, not what FRR did with it.
+		ownerIP := ""
+		for idx := range clusterInfo.nodes {
+			if nodeName(idx) == ownerNode {
+				ownerIP = nodeIPv4(idx)
+				break
+			}
+		}
+		require.NotEmpty(t, ownerIP, "Could not resolve the IP of the owner Node %q", ownerNode)
+		for _, p := range paths {
+			if p.Nexthop == ownerIP {
+				assert.Equal(t, uint32(base), p.MED, "The Node owning %s must advertise the base MED, got: %+v", prefix, paths)
+			} else {
+				assert.NotEqual(t, uint32(base), p.MED, "Only the Node owning %s may advertise the base MED, got: %+v", prefix, paths)
+			}
+		}
+	})
+}

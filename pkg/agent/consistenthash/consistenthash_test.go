@@ -256,3 +256,91 @@ func benchmarkGet(b *testing.B, shards int) {
 		hash.Get(buckets[i&(shards-1)])
 	}
 }
+
+func TestGetNWithFilters(t *testing.T) {
+	keys := []string{"1", "2", "3", "4", "5"}
+	m := New(50, nil)
+	m.Add(keys...)
+
+	// The full order is what the ring produces for the test key; the assertions below are all
+	// expressed relative to it, so that the test does not depend on the hash function.
+	fullOrder := m.GetNWithFilters("2", 0)
+	require.Len(t, fullOrder, len(keys), "a non-positive n must return every key")
+	assert.ElementsMatch(t, keys, fullOrder, "every key must appear exactly once")
+
+	t.Run("first key matches GetWithFilters", func(t *testing.T) {
+		assert.Equal(t, m.GetWithFilters("2"), fullOrder[0])
+	})
+
+	t.Run("order is stable", func(t *testing.T) {
+		assert.Equal(t, fullOrder, m.GetNWithFilters("2", 0))
+	})
+
+	t.Run("n limits the result", func(t *testing.T) {
+		assert.Equal(t, fullOrder[:3], m.GetNWithFilters("2", 3))
+	})
+
+	t.Run("n larger than the ring returns every key", func(t *testing.T) {
+		assert.Equal(t, fullOrder, m.GetNWithFilters("2", 100))
+	})
+
+	t.Run("removing the first key promotes the second one", func(t *testing.T) {
+		// This is the property the BGP MED ranking relies on: the rank of a Node only shifts by one
+		// when a more preferred Node leaves.
+		m.Remove(fullOrder[0])
+		defer m.Add(fullOrder[0])
+		assert.Equal(t, fullOrder[1:], m.GetNWithFilters("2", 0))
+	})
+
+	t.Run("filters exclude keys without reordering the rest", func(t *testing.T) {
+		excluded := fullOrder[1]
+		got := m.GetNWithFilters("2", 0, func(s string) bool { return s != excluded })
+		var expected []string
+		for _, k := range fullOrder {
+			if k != excluded {
+				expected = append(expected, k)
+			}
+		}
+		assert.Equal(t, expected, got)
+	})
+
+	t.Run("no key passes the filters", func(t *testing.T) {
+		assert.Empty(t, m.GetNWithFilters("2", 0, func(string) bool { return false }))
+	})
+
+	t.Run("empty ring", func(t *testing.T) {
+		assert.Empty(t, New(50, nil).GetNWithFilters("2", 0))
+	})
+}
+
+// TestGetNWithFiltersRemovalEquivalence pins down the invariant that the ranking is built on: the
+// i-th entry is what Get would return if the entries before it were removed from the ring. Egress
+// and ServiceExternalIP failover rely on it to move an IP to the next ranked Node rather than an
+// arbitrary one, and the BGP MED ranking relies on it so that a Node's rank only shifts by one when
+// a more preferred Node leaves.
+func TestGetNWithFiltersRemovalEquivalence(t *testing.T) {
+	for _, numKeys := range []int{1, 2, 3, 5, 10} {
+		t.Run(strconv.Itoa(numKeys)+" keys", func(t *testing.T) {
+			keys := make([]string, 0, numKeys)
+			for i := 0; i < numKeys; i++ {
+				keys = append(keys, fmt.Sprintf("node-%d", i))
+			}
+			m := New(50, nil)
+			m.Add(keys...)
+
+			for _, key := range []string{"10.0.0.1", "10.0.0.2", "192.168.77.150", "fec0::1"} {
+				ranking := m.GetNWithFilters(key, 0)
+				require.Len(t, ranking, numKeys, "every key must be ranked")
+
+				// Remove the ranked keys one at a time; the head of the remaining ranking must always
+				// be what a plain Get returns.
+				shrunk := New(50, nil)
+				shrunk.Add(keys...)
+				for rank, expected := range ranking {
+					require.Equal(t, expected, shrunk.Get(key), "key=%s rank=%d", key, rank)
+					shrunk.Remove(expected)
+				}
+			}
+		})
+	}
+}
